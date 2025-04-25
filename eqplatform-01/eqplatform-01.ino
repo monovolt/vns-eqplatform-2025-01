@@ -24,10 +24,14 @@ constexpr int IR_PIN = 12;   // IR receiver
 const unsigned long MAX_DELAY = 180;
 unsigned long default_delay = 5300;
 unsigned long tracking_delay = 5300;
+unsigned long stop_delay = 9999999;
 
-// IR debouncing
-unsigned long lastIRTime = 0;
-const unsigned long IR_DEBOUNCE = 100;
+
+unsigned long lastStepTime = 0;
+
+// 디바운스 관련 변수
+unsigned long lastIRCommandTime = 0;
+const unsigned long IR_DEBOUNCE_INTERVAL = 200;  // 200ms
 
 // motor state
 bool motorRunning = false;
@@ -52,16 +56,78 @@ String currentStatus = "Welcome..";
 #define NOTE_G6 1568
 #define NOTE_A6 1760
 
+// LG 종료음
+#define NOTE_AS4 466
+#define NOTE_CS5 554
+#define NOTE_DS5 622
+#define NOTE_FS5 740
+#define NOTE_GS4  415
+#define NOTE_B4   494
+#define NOTE_GS5 831
+
 // "반짝반짝 작은별" 첫 구절
 int starMelody[] = { NOTE_C5, NOTE_C5, NOTE_G5, NOTE_G5, NOTE_A5, NOTE_A5, NOTE_G5 };
 int starDurations[] = { 250, 250, 250, 250, 250, 250, 500 };
 const int starLen = sizeof(starMelody) / sizeof(int);
 
 // LG 종료음 일부
-int lgMelody[] = { NOTE_E6, NOTE_G6, NOTE_A6, NOTE_G6, NOTE_E6, NOTE_D6 };
-int lgDurations[] = { 150, 150, 150, 150, 150, 150 };
+int lgMelody[] = {
+  NOTE_CS5, // C#5
+  NOTE_FS5, // F#5
+  NOTE_F5,  // F5 (E#5로 읽음)
+  NOTE_DS5, // D#5
+  NOTE_CS5, // C#5
+  NOTE_AS4,  // A#4
+
+  NOTE_B4, NOTE_CS5, NOTE_DS5,
+  NOTE_GS4, NOTE_AS4, NOTE_B4,
+  NOTE_AS4, NOTE_CS5,
+
+  NOTE_CS5,
+  NOTE_FS5, NOTE_F5, NOTE_DS5,
+  NOTE_CS5,
+  NOTE_FS5,
+
+  NOTE_FS5, NOTE_GS5, NOTE_FS5,
+  NOTE_F5, NOTE_DS5, NOTE_F5,
+  NOTE_FS5
+};
+
+int lgMelodyDurations[] = {
+  500, 166, 166, 166, 500, 500,
+
+  166, 166, 166,
+  166, 166, 166,
+  500, 500,
+
+  500,
+  166, 166, 166,
+  500,
+  500,
+
+  166, 166, 166,
+  166, 166, 166,
+  1000
+};
 const int lgLen = sizeof(lgMelody) / sizeof(int);
 
+int stopMelodyA[] = {880, 784, 698, 698};
+int stopDurationsA[] = {200, 200, 200, 300};
+
+int stopMelodyB[] = {659, 587, 523};
+int stopDurationsB[] = {300, 300, 300};
+
+int trackingMelodyA[] = {523, 587, 659, 698, 784};
+int trackingDurationsA[] = {200, 200, 200, 200, 300};
+
+int trackingMelodyB[] = {523, 659, 784, 1046};
+int trackingDurationsB[] = {250, 250, 250, 250};
+
+int speedSaveMelodyA[] = {523, 659, 784};
+int speedSaveDurationsA[] = {150, 150, 150};
+
+int speedSaveMelodyB[] = {392, 392, 392};
+int speedSaveDurationsB[] = {200, 200, 200};
 
 #define SCREEN_WIDTH 128  // OLED display width, in pixels
 #define SCREEN_HEIGHT 64  // OLED display height, in pixels
@@ -101,7 +167,7 @@ void setup() {
   // Show initial display buffer contents on the screen --
   // the library initializes this with an Adafruit splash screen.
   display.display();
-  delay(2000); // Pause for 2 seconds
+  delay(2000);  // Pause for 2 seconds
 
   // Clear the buffer
   display.clearDisplay();
@@ -122,26 +188,48 @@ void setup() {
   pinMode(piezoPin, OUTPUT);
 
   updateDisplay();
-
 }
 
 void loop() {
   checkButtons();
-  checkIR();
+  if (IrReceiver.decode()) {
+    if (IrReceiver.decodedIRData.protocol == UNKNOWN) {
+      Serial.println(F("Received noise or an unknown (or not yet enabled) protocol"));
+      // We have an unknown protocol here, print extended info
+      IrReceiver.printIRResultRawFormatted(&Serial, true);
+      IrReceiver.resume();  // Do it here, to preserve raw data for printing with printIRResultRawFormatted()
+    } else {
+      IrReceiver.resume();  // Early enable receiving of the next IR frame
+      IrReceiver.printIRResultShort(&Serial);
+      IrReceiver.printIRSendUsage(&Serial);
+      // 디바운싱: 이전 명령 처리 이후 설정한 간격이 지났는지 확인
+      if (millis() - lastIRCommandTime >= IR_DEBOUNCE_INTERVAL) {
+          checkIR(IrReceiver.decodedIRData.command);
+          lastIRCommandTime = millis();  // 마지막 처리 시각 업데이트
+      }
+    }
+    Serial.println();
+  }
 
   // 모터 구동 상태이면 한 스텝씩 펄스 발생
   if (motorRunning) {
     // 이동 방향에 따라 모터 방향 설정 및 딜레이 적용
+    unsigned long now = millis();
     if (moveRight) {
-      // 오른쪽(시계방향) -> MAX_DELAY 사용
-      digitalWrite(dirPin, HIGH);
-      stepMotors();
-      delay(MAX_DELAY);
+      if (now - lastStepTime >= MAX_DELAY) {
+        // 오른쪽(시계방향) -> MAX_DELAY 사용
+        digitalWrite(dirPin, HIGH);
+        stepMotors();
+        //delay(MAX_DELAY);
+      }
+      
     } else {
-      // 왼쪽(반시계방향) -> tracking_delay 사용
-      digitalWrite(dirPin, LOW);
-      stepMotors();
-      delay(tracking_delay);
+      if (now - lastStepTime >= tracking_delay) {
+        // 왼쪽(반시계방향) -> tracking_delay 사용
+        digitalWrite(dirPin, LOW);
+        stepMotors();
+        //delay(tracking_delay);
+      }
     }
   }
 }
@@ -149,104 +237,83 @@ void loop() {
 void checkButtons() {
   if (digitalRead(btn1Pin) == LOW) {
     // 준비 위치(오른쪽 끝)
-    delay(10);
-    if (digitalRead(btn1Pin) != LOW) return;
+    // delay(10);
+    // if (digitalRead(btn1Pin) != LOW) return;
     stopMotors();
     atRightEnd = true;
     currentStatus = "Start Rdy";
     updateDisplay();
     playMelody(starMelody, starDurations, starLen);
+    delay(300);
   }
   if (digitalRead(btn2Pin) == LOW) {
     // 도착 완료(왼쪽 끝)
-    delay(10);
-    if (digitalRead(btn2Pin) != LOW) return;
+    // delay(10);
+    // if (digitalRead(btn2Pin) != LOW) return;
     stopMotors();
     atRightEnd = false;
     currentStatus = "End.";
     updateDisplay();
-    playMelody(lgMelody, lgDurations, lgLen);
+    playMelody(lgMelody, lgMelodyDurations, lgLen);
+    delay(300);
   }
   if (digitalRead(btn3Pin) == LOW) {
     // 정지
-    delay(10);
-    if (digitalRead(btn3Pin) != LOW) return;
+    // delay(10);
+    // if (digitalRead(btn3Pin) != LOW) return;
     stopMotors();
     currentStatus = "Stopped";
     updateDisplay();
-    playBeep(2000);
+    playMelody(stopMelodyA, stopDurationsA, sizeof(stopMelodyA) / sizeof(stopMelodyA[0]));
+    delay(300);
   }
   if (digitalRead(btn4Pin) == LOW) {
     // 원래 방향 재구동
-    delay(10);
-    if (digitalRead(btn4Pin) != LOW) return;
+    // delay(10);
+    // if (digitalRead(btn4Pin) != LOW) return;
     if (atRightEnd) {
       moveRight = false;
       tracking_delay = default_delay;
       currentStatus = "Tracking..";
+      playMelody(trackingMelodyB, trackingDurationsB, sizeof(trackingMelodyB) / sizeof(trackingMelodyB[0]));
     } else {
       moveRight = true;
       tracking_delay = MAX_DELAY;
       currentStatus = "Mov B Pos";
+      playBeep(1000);
     }
     motorRunning = true;
     updateDisplay();
+    delay(300);
   }
-  delay(300);
 }
 
 
-void checkIR() {
-  if (!IrReceiver.decode()) return;
-  /*
-    * Print a summary of received data
-    */
-  if (IrReceiver.decodedIRData.protocol == UNKNOWN) {
-    Serial.println(F("Received noise or an unknown (or not yet enabled) protocol"));
-    // We have an unknown protocol here, print extended info
-    IrReceiver.printIRResultRawFormatted(&Serial, true);
-    IrReceiver.resume();  // 다음 IR 프레임 수신을 위해 버퍼 리셋
-    return;
-  } else {
-    IrReceiver.resume(); // 다음 IR 프레임을 조기에 수신할 수 있도록 활성화
-    IrReceiver.printIRResultShort(&Serial);
-    IrReceiver.printIRSendUsage(&Serial);
-  }
-
-  if (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) {
-    IrReceiver.resume();
-    return;
-  }
-
-  unsigned long cmd = IrReceiver.decodedIRData.command;
-
-  // 디바운스: 마지막 처리 후 일정 시간 Pass 여부
-  // if (millis() - lastIRTime < IR_DEBOUNCE) {
-  //   IrReceiver.resume();
-  //   return;
-  // }
-  // lastIRTime = millis();
-
+void checkIR(long cmd) {
+  
   switch (cmd) {
     case 69:
       // 버튼1
-      motorRunning = false;
+      stopMotors();
       atRightEnd = true;
       currentStatus = "Start Rdy";
+      updateDisplay();
       playMelody(starMelody, starDurations, starLen);
       break;
     case 70:
       // 버튼2
-      motorRunning = false;
+      stopMotors();
       atRightEnd = false;
       currentStatus = "End.";
-      playMelody(lgMelody, lgDurations, lgLen);
+      updateDisplay();
+      playMelody(lgMelody, lgMelodyDurations, lgLen);
       break;
     case 13:
       // 버튼#
-      motorRunning = false;
+      stopMotors();
       currentStatus = "Stopped";
-      playBeep(2000);
+      updateDisplay();
+      playMelody(stopMelodyA, stopDurationsA, sizeof(stopMelodyA) / sizeof(stopMelodyA[0]));
       break;
     case 28:
       // OK: tracking_delay reset 후 재구동
@@ -254,11 +321,14 @@ void checkIR() {
         moveRight = false;
         tracking_delay = default_delay;
         currentStatus = "Tracking..";
+        playMelody(trackingMelodyB, trackingDurationsB, sizeof(trackingMelodyB) / sizeof(trackingMelodyB[0]));
       } else {
         moveRight = true;
         tracking_delay = MAX_DELAY;
         currentStatus = "Mov B Pos";
+        playBeep(1000);
       }
+      updateDisplay();
       motorRunning = true;
       break;
     case 90:
@@ -268,6 +338,7 @@ void checkIR() {
       tracking_delay = MAX_DELAY;
       motorRunning = true;
       currentStatus = "Mov B Pos";
+      updateDisplay();
       break;
     case 8:
       // 왼쪽 화살표
@@ -276,28 +347,35 @@ void checkIR() {
       tracking_delay = MAX_DELAY;
       motorRunning = true;
       currentStatus = "Mov E Pos";
+      updateDisplay();
       break;
     case 24:
       // 위 화살표: 속도 증가
       tracking_delay = max((long)tracking_delay - 50, 50L);
+      updateDisplay();
       Serial.println(tracking_delay);
       break;
     case 82:
       // 아래 화살표: 속도 감소
       tracking_delay += 50;
+      updateDisplay();
       Serial.println(tracking_delay);
       break;
     case 25:
       // 0: 속도 저장
-      default_delay = tracking_delay;
-      break;
+      if (currentStatus == "Tracking..") {
+        default_delay = tracking_delay;
+        playMelody(speedSaveMelodyA, speedSaveDurationsA, sizeof(speedSaveMelodyA) / sizeof(speedSaveMelodyA[0]));
+        updateDisplay();
+      } else {
+        playBeepLow(200);
+      }
+      break; 
     default:
       currentStatus = "Unknown Cmd";
       break;
   }
   IrReceiver.resume();
-
-  updateDisplay();
 }
 // 두 모터에 동시에 한 스텝 펄스 발생
 void stepMotors() {
@@ -309,12 +387,13 @@ void stepMotors() {
 // 모터 정지
 void stopMotors() {
   motorRunning = false;
+  tracking_delay = stop_delay;
 }
 
 void updateDisplay() {
   display.clearDisplay();
-  display.setTextSize(2);             // Normal 1:1 pixel scale
-  display.setTextColor(SSD1306_WHITE);        // Draw white text
+  display.setTextSize(2);               // Normal 1:1 pixel scale
+  display.setTextColor(SSD1306_WHITE);  // Draw white text
   display.setCursor(0, 0);
   display.println(currentStatus);
   display.print("T: ");
@@ -329,13 +408,19 @@ void updateDisplay() {
 void playMelody(int *melody, int *durations, int length) {
   for (int i = 0; i < length; i++) {
     tone(piezoPin, melody[i], durations[i]);
-    delay(durations[i] * 1.3);
+    delay(durations[i] * 1.2);
     noTone(piezoPin);
   }
 }
 
 void playBeep(int duration) {
   tone(piezoPin, 1000);
+  delay(duration);
+  noTone(piezoPin);
+}
+
+void playBeepLow(int duration) {
+  tone(piezoPin, 200);
   delay(duration);
   noTone(piezoPin);
 }
