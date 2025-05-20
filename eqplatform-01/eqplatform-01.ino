@@ -2,11 +2,16 @@
 #include <IRremote.hpp>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <TMCStepper.h>
+
 
 #if !defined(STR_HELPER)
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 #endif
+
+#define R_SENSE 0.11f
+TMC2209Stepper driver((Stream *)&Serial1, R_SENSE, 0x00);  // 기본 슬레이브 주소 0
 
 // pins
 constexpr int enablePin = 2;  // TMC2226 ENABLE (LOW = enabled)
@@ -19,11 +24,12 @@ constexpr int btn3Pin = 7;  // 모터 정지
 constexpr int btn4Pin = 8;  // 원래 방향 재구동
 
 constexpr int piezoPin = 9;  // piezo speaker
-constexpr int IR_PIN = 12;   // IR receiver
+constexpr int ledPin = 11;   // Red LED. 보조배터리 전원공급 유지용
+constexpr int irPin = 12;    // IR receiver
 
-const unsigned long MAX_DELAY = 180;
-unsigned long default_delay = 5300;
-unsigned long tracking_delay = 5300;
+const unsigned long MAX_DELAY = 80;
+unsigned long default_delay = 11365;   // AI 추천값 11365, 마지막 측정값 5300
+unsigned long tracking_delay = 11365;  // AI 추천값 11365, 마지막 측정값 5300
 unsigned long stop_delay = 9999999;
 
 
@@ -61,8 +67,8 @@ String currentStatus = "Welcome..";
 #define NOTE_CS5 554
 #define NOTE_DS5 622
 #define NOTE_FS5 740
-#define NOTE_GS4  415
-#define NOTE_B4   494
+#define NOTE_GS4 415
+#define NOTE_B4 494
 #define NOTE_GS5 831
 
 // "반짝반짝 작은별" 첫 구절
@@ -72,11 +78,11 @@ const int starLen = sizeof(starMelody) / sizeof(int);
 
 // LG 종료음 일부
 int lgMelody[] = {
-  NOTE_CS5, // C#5
-  NOTE_FS5, // F#5
-  NOTE_F5,  // F5 (E#5로 읽음)
-  NOTE_DS5, // D#5
-  NOTE_CS5, // C#5
+  NOTE_CS5,  // C#5
+  NOTE_FS5,  // F#5
+  NOTE_F5,   // F5 (E#5로 읽음)
+  NOTE_DS5,  // D#5
+  NOTE_CS5,  // C#5
   NOTE_AS4,  // A#4
 
   NOTE_B4, NOTE_CS5, NOTE_DS5,
@@ -111,23 +117,23 @@ int lgMelodyDurations[] = {
 };
 const int lgLen = sizeof(lgMelody) / sizeof(int);
 
-int stopMelodyA[] = {880, 784, 698, 698};
-int stopDurationsA[] = {200, 200, 200, 300};
+int stopMelodyA[] = { 880, 784, 698, 698 };
+int stopDurationsA[] = { 200, 200, 200, 300 };
 
-int stopMelodyB[] = {659, 587, 523};
-int stopDurationsB[] = {300, 300, 300};
+int stopMelodyB[] = { 659, 587, 523 };
+int stopDurationsB[] = { 300, 300, 300 };
 
-int trackingMelodyA[] = {523, 587, 659, 698, 784};
-int trackingDurationsA[] = {200, 200, 200, 200, 300};
+int trackingMelodyA[] = { 523, 587, 659, 698, 784 };
+int trackingDurationsA[] = { 200, 200, 200, 200, 300 };
 
-int trackingMelodyB[] = {523, 659, 784, 1046};
-int trackingDurationsB[] = {250, 250, 250, 250};
+int trackingMelodyB[] = { 523, 659, 784, 1046 };
+int trackingDurationsB[] = { 250, 250, 250, 250 };
 
-int speedSaveMelodyA[] = {523, 659, 784};
-int speedSaveDurationsA[] = {150, 150, 150};
+int speedSaveMelodyA[] = { 523, 659, 784 };
+int speedSaveDurationsA[] = { 150, 150, 150 };
 
-int speedSaveMelodyB[] = {392, 392, 392};
-int speedSaveDurationsB[] = {200, 200, 200};
+int speedSaveMelodyB[] = { 392, 392, 392 };
+int speedSaveDurationsB[] = { 200, 200, 200 };
 
 #define SCREEN_WIDTH 128  // OLED display width, in pixels
 #define SCREEN_HEIGHT 64  // OLED display height, in pixels
@@ -151,11 +157,11 @@ void setup() {
   // Just to know which program is running on my Arduino
   Serial.println(F("START " __FILE__ " from " __DATE__ "\r\nUsing library version " VERSION_IRREMOTE));
   // Start the receiver and if not 3. parameter specified, take LED_BUILTIN pin from the internal boards definition as default feedback LED
-  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
+  IrReceiver.begin(irPin, ENABLE_LED_FEEDBACK);
 
   Serial.print(F("Ready to receive IR signals of protocols: "));
   printActiveIRProtocols(&Serial);
-  Serial.println(F("at pin " STR(IR_PIN)));
+  Serial.println(F("at pin " STR(irPin)));
 
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -178,6 +184,15 @@ void setup() {
   pinMode(dirPin, OUTPUT);
   digitalWrite(enablePin, LOW);  // enable driver
 
+  // TMC2226 Setup Using UART
+  Serial1.begin(115200);
+  driver.begin();
+  driver.toff(4);                // 필수 초기 설정
+  driver.rms_current(600);       // mA
+  driver.hold_multiplier(0.3);   // 정지 시 전류 줄이기
+  driver.en_spreadCycle(false);  // StealthChop 모드 활성화
+  driver.microsteps(8);          // 8 마이크로스텝으로 설정
+
   // buttons
   pinMode(btn1Pin, INPUT_PULLUP);
   pinMode(btn2Pin, INPUT_PULLUP);
@@ -186,6 +201,10 @@ void setup() {
 
   // piezo
   pinMode(piezoPin, OUTPUT);
+
+  // LED Red
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, HIGH);
 
   updateDisplay();
 }
@@ -204,8 +223,8 @@ void loop() {
       IrReceiver.printIRSendUsage(&Serial);
       // 디바운싱: 이전 명령 처리 이후 설정한 간격이 지났는지 확인
       if (millis() - lastIRCommandTime >= IR_DEBOUNCE_INTERVAL) {
-          checkIR(IrReceiver.decodedIRData.command);
-          lastIRCommandTime = millis();  // 마지막 처리 시각 업데이트
+        checkIR(IrReceiver.decodedIRData.command);
+        lastIRCommandTime = millis();  // 마지막 처리 시각 업데이트
       }
     }
     Serial.println();
@@ -220,15 +239,15 @@ void loop() {
         // 오른쪽(시계방향) -> MAX_DELAY 사용
         digitalWrite(dirPin, HIGH);
         stepMotors();
-        //delay(MAX_DELAY);
+        delayMicroseconds(MAX_DELAY);
       }
-      
+
     } else {
       if (now - lastStepTime >= tracking_delay) {
         // 왼쪽(반시계방향) -> tracking_delay 사용
         digitalWrite(dirPin, LOW);
         stepMotors();
-        //delay(tracking_delay);
+        delayMicroseconds(tracking_delay);
       }
     }
   }
@@ -290,10 +309,18 @@ void checkButtons() {
 
 
 void checkIR(long cmd) {
-  
+
   switch (cmd) {
     case 69:
-      // 버튼1
+      // 버튼1 종료위치이동완료
+      stopMotors();
+      atRightEnd = false;
+      currentStatus = "End.";
+      updateDisplay();
+      playMelody(lgMelody, lgMelodyDurations, lgLen);
+      break;
+    case 71:
+      // 버튼3  시작위치이동완료
       stopMotors();
       atRightEnd = true;
       currentStatus = "Start Rdy";
@@ -301,15 +328,14 @@ void checkIR(long cmd) {
       playMelody(starMelody, starDurations, starLen);
       break;
     case 70:
-      // 버튼2
+      // 버튼2 정지. 버튼#과 동일
       stopMotors();
-      atRightEnd = false;
-      currentStatus = "End.";
+      currentStatus = "Stopped";
       updateDisplay();
-      playMelody(lgMelody, lgMelodyDurations, lgLen);
+      playMelody(stopMelodyA, stopDurationsA, sizeof(stopMelodyA) / sizeof(stopMelodyA[0]));
       break;
     case 13:
-      // 버튼#
+      // 버튼# 정지. 버튼2와 동일
       stopMotors();
       currentStatus = "Stopped";
       updateDisplay();
@@ -350,19 +376,31 @@ void checkIR(long cmd) {
       updateDisplay();
       break;
     case 24:
-      // 위 화살표: 속도 증가
-      tracking_delay = max((long)tracking_delay - 50, 50L);
+      // 위 화살표: 속도 증가 50씩
+      tracking_delay = max((long)tracking_delay - 50, MAX_DELAY);
       updateDisplay();
       Serial.println(tracking_delay);
       break;
     case 82:
-      // 아래 화살표: 속도 감소
+      // 아래 화살표: 속도 감소 50씩
       tracking_delay += 50;
       updateDisplay();
       Serial.println(tracking_delay);
       break;
+    case 67:
+      // 버튼 6: 속도 증가 500씩
+      tracking_delay = max((long)tracking_delay - 500, MAX_DELAY);
+      updateDisplay();
+      Serial.println(tracking_delay);
+      break;
+    case 68:
+      // 버튼 4: 속도 감소 500씩
+      tracking_delay += 500;
+      updateDisplay();
+      Serial.println(tracking_delay);
+      break;
     case 25:
-      // 0: 속도 저장
+      // 0: 속도 저장 Tracking.. 때만 저장 됨.
       if (currentStatus == "Tracking..") {
         default_delay = tracking_delay;
         playMelody(speedSaveMelodyA, speedSaveDurationsA, sizeof(speedSaveMelodyA) / sizeof(speedSaveMelodyA[0]));
@@ -370,7 +408,16 @@ void checkIR(long cmd) {
       } else {
         playBeepLow(200);
       }
-      break; 
+      break;
+    case 64:
+      // 버튼 5 : 어떤 상태에서건 Tracking.. 상태로
+      moveRight = false;
+      tracking_delay = default_delay;
+      currentStatus = "Tracking..";
+      playMelody(trackingMelodyB, trackingDurationsB, sizeof(trackingMelodyB) / sizeof(trackingMelodyB[0]));
+      updateDisplay();
+      motorRunning = true;
+      break;
     default:
       currentStatus = "Unknown Cmd";
       break;
@@ -380,7 +427,7 @@ void checkIR(long cmd) {
 // 두 모터에 동시에 한 스텝 펄스 발생
 void stepMotors() {
   digitalWrite(stepPin, HIGH);
-  delayMicroseconds(100);  // 짧은 펄스 지속시간
+  delayMicroseconds(80);  // 최소 펄스 유지 시간
   digitalWrite(stepPin, LOW);
 }
 
@@ -402,7 +449,7 @@ void updateDisplay() {
   display.print(default_delay);
   display.display();
   Serial.println(currentStatus);
-  delay(10);
+  // delay(10);
 }
 
 void playMelody(int *melody, int *durations, int length) {
