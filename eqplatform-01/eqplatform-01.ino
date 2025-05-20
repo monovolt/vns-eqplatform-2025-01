@@ -189,9 +189,10 @@ void setup() {
   driver.begin();
   driver.toff(4);                // 필수 초기 설정
   driver.rms_current(600);       // mA
-  driver.hold_multiplier(0.3);   // 정지 시 전류 줄이기
-  driver.en_spreadCycle(false);  // StealthChop 모드 활성화
+  driver.hold_multiplier(1.0);   // 정지 시 전류 100% 유지. -- 보조배터리 전원 차단 문제 때문.
+  driver.en_spreadCycle(true);  // StealthChop Off
   driver.microsteps(8);          // 8 마이크로스텝으로 설정
+  driver.intpol(true);           // 보간 켬 (기본값)
 
   // buttons
   pinMode(btn1Pin, INPUT_PULLUP);
@@ -280,6 +281,7 @@ void checkButtons() {
     // 정지
     // delay(10);
     // if (digitalRead(btn3Pin) != LOW) return;
+    printDrvStatus();
     stopMotors();
     currentStatus = "Stopped";
     updateDisplay();
@@ -329,6 +331,7 @@ void checkIR(long cmd) {
       break;
     case 70:
       // 버튼2 정지. 버튼#과 동일
+      printDrvStatus();
       stopMotors();
       currentStatus = "Stopped";
       updateDisplay();
@@ -336,6 +339,7 @@ void checkIR(long cmd) {
       break;
     case 13:
       // 버튼# 정지. 버튼2와 동일
+      printDrvStatus();
       stopMotors();
       currentStatus = "Stopped";
       updateDisplay();
@@ -470,4 +474,42 @@ void playBeepLow(int duration) {
   tone(piezoPin, 200);
   delay(duration);
   noTone(piezoPin);
+}
+
+void printDrvStatus() {
+  uint32_t drvStatus = driver.DRV_STATUS();
+
+  Serial.println(F("===== TMC2226 DRV_STATUS ====="));
+
+  // 온도 경고
+  bool otpWarning = (drvStatus >> 26) & 0x01;
+  Serial.print(F("Overtemperature Warning (OTPW): "));
+  Serial.println(otpWarning ? "⚠️ YES" : "OK");
+
+  // 온도 과열 셧다운
+  bool otShutdown = (drvStatus >> 25) & 0x01;
+  Serial.print(F("Overtemperature Shutdown (OT): "));
+  Serial.println(otShutdown ? "🔥 YES (driver shutdown!)" : "OK");
+
+  // 스텝 손실 감지
+  bool stallGuardA = (drvStatus >> 24) & 0x01;
+  bool stallGuardB = (drvStatus >> 23) & 0x01;
+  Serial.print(F("StallGuard A (lost steps): "));
+  Serial.println(stallGuardA ? "❌ LOST" : "OK");
+
+  Serial.print(F("StallGuard B (lost steps): "));
+  Serial.println(stallGuardB ? "❌ LOST" : "OK");
+
+  // 전류 스케일
+  uint8_t cs_actual = (drvStatus >> 16) & 0x1F;
+  Serial.print(F("Current Scale (CS_ACTUAL): "));
+  Serial.print(cs_actual);
+  Serial.println(F(" (0=off, 31=max)"));
+
+  // 스텝 속도 상태 (스텝 누락 판정 감도)
+  uint16_t tstep = driver.TSTEP();
+  Serial.print(F("TSTEP (time between steps): "));
+  Serial.println(tstep);
+
+  Serial.println(F("=============================="));
 }
