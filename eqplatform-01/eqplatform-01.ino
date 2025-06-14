@@ -3,6 +3,11 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <TMCStepper.h>
+#include <MPU9250_asukiaaa.h>
+
+MPU9250_asukiaaa sensor;
+float pitch = 0, roll = 0;
+const float LIMIT_ANGLE = 30.0;  // 예시: ±4도 제한
 
 
 #if !defined(STR_HELPER)
@@ -22,16 +27,18 @@ constexpr int btn1Pin = 5;  // 오른쪽 끝 확인
 constexpr int btn2Pin = 6;  // 왼쪽 끝 확인
 constexpr int btn3Pin = 7;  // 모터 정지
 constexpr int btn4Pin = 8;  // 원래 방향 재구동
+constexpr int btn5Pin = 9;  // 초기화(가운데로 이동) - Welcome..
 
-constexpr int piezoPin = 9;  // piezo speaker
+constexpr int piezoPin = 10;  // piezo speaker
 constexpr int ledPin = 11;   // Red LED. 보조배터리 전원공급 유지용
 constexpr int irPin = 12;    // IR receiver
 
 const unsigned long MAX_DELAY = 80;
 unsigned long default_delay = 11365;   // AI 추천값 11365, 마지막 측정값 5300
 unsigned long tracking_delay = 11365;  // AI 추천값 11365, 마지막 측정값 5300
-unsigned long stop_delay = 9999999;
+unsigned long stop_delay = 99999999;
 
+float leveling_tolerance = 0.5;
 
 unsigned long lastStepTime = 0;
 
@@ -55,12 +62,12 @@ String currentStatus = "Welcome..";
 #define NOTE_G5 784
 #define NOTE_A5 880
 #define NOTE_B5 988
-#define NOTE_C6 1047
-#define NOTE_D6 1175
-#define NOTE_E6 1319
-#define NOTE_F6 1397
-#define NOTE_G6 1568
-#define NOTE_A6 1760
+
+#define NOTE_C4  262
+#define NOTE_D4  294
+#define NOTE_F4  349
+#define NOTE_G4  392
+#define NOTE_A4  440
 
 // LG 종료음
 #define NOTE_AS4 466
@@ -123,8 +130,8 @@ int stopDurationsA[] = { 200, 200, 200, 300 };
 int stopMelodyB[] = { 659, 587, 523 };
 int stopDurationsB[] = { 300, 300, 300 };
 
-int trackingMelodyA[] = { 523, 587, 659, 698, 784 };
-int trackingDurationsA[] = { 200, 200, 200, 200, 300 };
+int levelingMelodyA[] = { 523, 587, 659, 698, 784 };
+int levelingDurationsA[] = { 200, 200, 200, 200, 300 };
 
 int trackingMelodyB[] = { 523, 659, 784, 1046 };
 int trackingDurationsB[] = { 250, 250, 250, 250 };
@@ -132,8 +139,19 @@ int trackingDurationsB[] = { 250, 250, 250, 250 };
 int speedSaveMelodyA[] = { 523, 659, 784 };
 int speedSaveDurationsA[] = { 150, 150, 150 };
 
-int speedSaveMelodyB[] = { 392, 392, 392 };
-int speedSaveDurationsB[] = { 200, 200, 200 };
+// 반달 - Welcome 음
+int welcomeMelody[] = {
+  NOTE_C5, NOTE_D5, NOTE_C5, NOTE_A4,    // 도 레 도 라
+  NOTE_C5, NOTE_A4, NOTE_F4, NOTE_C4,    // 도 라 파 도
+  NOTE_D4, NOTE_F4, NOTE_G4, NOTE_C5, NOTE_A4 // 레(낮은 레!) 파 솔 도 라
+};
+
+int welcomeDurations[] = {
+  400, 200, 400, 200,     // 도 레 도 라
+  200, 200, 200, 600,     // 도 라 파 도
+  400, 200, 400, 200, 800 // 레 파 솔 도 라
+};
+
 
 #define SCREEN_WIDTH 128  // OLED display width, in pixels
 #define SCREEN_HEIGHT 64  // OLED display height, in pixels
@@ -142,12 +160,30 @@ int speedSaveDurationsB[] = { 200, 200, 200 };
 #define SCREEN_ADDRESS 0x3C  ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// OLED Display 갱신 interval
+unsigned long lastDisplayUpdate = 0;
+const unsigned long DISPLAY_UPDATE_INTERVAL = 500; // 500ms
 
 
-int buttonState1 = 0;  // variable for reading the pushbutton status
-int buttonState2 = 0;  // variable for reading the pushbutton status
-int buttonState3 = 0;  // variable for reading the pushbutton status
-int buttonState4 = 0;  // variable for reading the pushbutton status
+// Roll, Pitch 값 필터용 변수
+// 필터 파라미터
+const int FILTER_SIZE = 20;         // 이동평균 샘플 개수 (원하면 10~20까지 조절)
+const float JUMP_THRESHOLD = 5.0;  // 한 번에 튈 때 무시할 각도 임계값
+
+// Roll용 버퍼
+float rollBuffer[FILTER_SIZE] = {0};
+int rollIndex = 0;
+float rollSum = 0;
+float lastRoll = 0;
+float rollFiltered = 0;
+
+// Pitch용 버퍼
+float pitchBuffer[FILTER_SIZE] = {0};
+int pitchIndex = 0;
+float pitchSum = 0;
+float lastPitch = 0;
+float pitchFiltered = 0;
+
 
 void setup() {
   Serial.begin(115200);
@@ -187,18 +223,19 @@ void setup() {
   // TMC2226 Setup Using UART
   Serial1.begin(115200);
   driver.begin();
-  driver.toff(4);                // 필수 초기 설정
-  driver.rms_current(600);       // mA
-  driver.hold_multiplier(1.0);   // 정지 시 전류 100% 유지. -- 보조배터리 전원 차단 문제 때문.
+  driver.toff(4);               // 필수 초기 설정
+  driver.rms_current(600);      // mA
+  driver.hold_multiplier(1.0);  // 정지 시 전류 100% 유지. -- 보조배터리 전원 차단 문제 때문.
   driver.en_spreadCycle(true);  // StealthChop Off
-  driver.microsteps(8);          // 8 마이크로스텝으로 설정
-  driver.intpol(true);           // 보간 켬 (기본값)
+  driver.microsteps(8);         // 8 마이크로스텝으로 설정
+  driver.intpol(true);          // 보간 켬 (기본값)
 
   // buttons
   pinMode(btn1Pin, INPUT_PULLUP);
   pinMode(btn2Pin, INPUT_PULLUP);
   pinMode(btn3Pin, INPUT_PULLUP);
   pinMode(btn4Pin, INPUT_PULLUP);
+  pinMode(btn5Pin, INPUT_PULLUP);
 
   // piezo
   pinMode(piezoPin, OUTPUT);
@@ -207,11 +244,23 @@ void setup() {
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, HIGH);
 
+
+  Wire.begin();
+  sensor.setWire(&Wire);
+  sensor.beginAccel();
+  // sensor.beginGyro(); // 기울기만 쓸 땐 생략해도 OK
+  // sensor.beginMag();  // 자력계 필요 없으니 생략
+  
   updateDisplay();
+  playMelody(welcomeMelody, welcomeDurations, sizeof(welcomeMelody) / sizeof(welcomeMelody[0]));
+
 }
 
 void loop() {
+  // 버튼 확인
   checkButtons();
+
+  // IR 리모컨 입력 확인
   if (IrReceiver.decode()) {
     if (IrReceiver.decodedIRData.protocol == UNKNOWN) {
       Serial.println(F("Received noise or an unknown (or not yet enabled) protocol"));
@@ -230,6 +279,29 @@ void loop() {
     }
     Serial.println();
   }
+
+  // MPU-9250 기울기 센서 인식 값 갱신
+  sensor.accelUpdate();
+  float ax = sensor.accelX();
+  float ay = sensor.accelY();
+  float az = sensor.accelZ();
+  
+  float rawPitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI; // 앞/뒤
+  float rawRoll  = atan2(ay, az) * 180.0 / PI * -1; // 좌/우
+
+  // 2. 필터 적용
+  pitchFiltered = filterValue(rawPitch, lastPitch, pitchBuffer, pitchIndex, pitchSum);
+  rollFiltered  = filterValue(rawRoll, lastRoll, rollBuffer, rollIndex, rollSum);
+
+  pitch = pitchFiltered; // 앞/뒤 - 전역변수
+  roll = rollFiltered;   // 좌/우 - 전역변수
+
+  // 각도 제한 체크 (좌우 임계 각도를 넘어가는지)
+  checkLeftLimit();
+  checkRightLimit();
+
+  // 레벨링 체크 
+  checkLevelingComplete();
 
   // 모터 구동 상태이면 한 스텝씩 펄스 발생
   if (motorRunning) {
@@ -251,6 +323,12 @@ void loop() {
         delayMicroseconds(tracking_delay);
       }
     }
+  }
+
+  // OLED 디스플레이 주기적 갱신
+  if (millis() - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
+    updateDisplay();
+    lastDisplayUpdate = millis();
   }
 }
 
@@ -307,6 +385,16 @@ void checkButtons() {
     updateDisplay();
     delay(300);
   }
+  if (digitalRead(btn5Pin) == LOW) {
+    // 레벨링 - 가운데로 이동 
+    // delay(10);
+    // if (digitalRead(btn3Pin) != LOW) return;
+    printDrvStatus();
+    stopMotors();
+    playMelody(levelingMelodyA, levelingDurationsA, sizeof(levelingMelodyA) / sizeof(levelingMelodyA[0]));
+    startLeveling();
+    delay(300);
+  }
 }
 
 
@@ -314,39 +402,83 @@ void checkIR(long cmd) {
 
   switch (cmd) {
     case 69:
-      // 버튼1 종료위치이동완료
+      // 0x45 버튼1 종료위치이동완료
       stopMotors();
       atRightEnd = false;
       currentStatus = "End.";
       updateDisplay();
       playMelody(lgMelody, lgMelodyDurations, lgLen);
       break;
+    case 70:
+      // 0x46 버튼2 정지. 버튼#과 동일
+      printDrvStatus();
+      stopMotors();
+      currentStatus = "Stopped";
+      updateDisplay();
+      playMelody(stopMelodyA, stopDurationsA, sizeof(stopMelodyA) / sizeof(stopMelodyA[0]));
+      break;
     case 71:
-      // 버튼3  시작위치이동완료
+      // 0x47 버튼3  시작위치이동완료
       stopMotors();
       atRightEnd = true;
       currentStatus = "Start Rdy";
       updateDisplay();
       playMelody(starMelody, starDurations, starLen);
       break;
-    case 70:
-      // 버튼2 정지. 버튼#과 동일
+
+
+    case 68:
+      // 0x44 버튼 4: 속도 감소 500씩
+      tracking_delay += 500;
+      updateDisplay();
+      Serial.println(tracking_delay);
+      break;
+    case 64:
+      // 0x40 버튼 5 : 어떤 상태에서건 Tracking.. 상태로
+      moveRight = false;
+      tracking_delay = default_delay;
+      currentStatus = "Tracking..";
+      playMelody(trackingMelodyB, trackingDurationsB, sizeof(trackingMelodyB) / sizeof(trackingMelodyB[0]));
+      updateDisplay();
+      motorRunning = true;
+      break;
+    case 67:
+      // 0x43 버튼 6: 속도 증가 500씩
+      tracking_delay = max((long)tracking_delay - 500, MAX_DELAY);
+      updateDisplay();
+      Serial.println(tracking_delay);
+      break;
+
+
+    case 22:
+      // 0x16 버튼 *: 가운데로 빠르게 이동후 Welcome.. 상태로
       printDrvStatus();
       stopMotors();
-      currentStatus = "Stopped";
-      updateDisplay();
-      playMelody(stopMelodyA, stopDurationsA, sizeof(stopMelodyA) / sizeof(stopMelodyA[0]));
+      playMelody(levelingMelodyA, levelingDurationsA, sizeof(levelingMelodyA) / sizeof(levelingMelodyA[0]));
+      startLeveling();
+      break;
+    case 25:
+      // 0x19 버튼 0: 속도 저장 Tracking.. 때만 저장 됨.
+      if (currentStatus == "Tracking..") {
+        default_delay = tracking_delay;
+        playMelody(speedSaveMelodyA, speedSaveDurationsA, sizeof(speedSaveMelodyA) / sizeof(speedSaveMelodyA[0]));
+        updateDisplay();
+      } else {
+        playBeepLow(200);
+      }
       break;
     case 13:
-      // 버튼# 정지. 버튼2와 동일
+      // 0xD 버튼# 정지. 버튼2와 동일
       printDrvStatus();
       stopMotors();
       currentStatus = "Stopped";
       updateDisplay();
       playMelody(stopMelodyA, stopDurationsA, sizeof(stopMelodyA) / sizeof(stopMelodyA[0]));
       break;
+
+
     case 28:
-      // OK: tracking_delay reset 후 재구동
+      // 0x1C OK: tracking_delay reset 후 재구동
       if (atRightEnd) {
         moveRight = false;
         tracking_delay = default_delay;
@@ -362,7 +494,7 @@ void checkIR(long cmd) {
       motorRunning = true;
       break;
     case 90:
-      // 오른쪽 화살표
+      // 0x5A 오른쪽 화살표 - 시작 위치 방향으로 빠르게 이동
       playBeep(1000);
       moveRight = true;
       tracking_delay = MAX_DELAY;
@@ -371,7 +503,7 @@ void checkIR(long cmd) {
       updateDisplay();
       break;
     case 8:
-      // 왼쪽 화살표
+      // 0x8 왼쪽 화살표 - 종료위치 방향으로 빠르게 이동
       playBeep(1000);
       moveRight = false;
       tracking_delay = MAX_DELAY;
@@ -380,50 +512,20 @@ void checkIR(long cmd) {
       updateDisplay();
       break;
     case 24:
-      // 위 화살표: 속도 증가 50씩
+      // 0x18 위 화살표: 속도 증가 50씩
       tracking_delay = max((long)tracking_delay - 50, MAX_DELAY);
       updateDisplay();
       Serial.println(tracking_delay);
       break;
     case 82:
-      // 아래 화살표: 속도 감소 50씩
+      // 0x52 아래 화살표: 속도 감소 50씩
       tracking_delay += 50;
       updateDisplay();
       Serial.println(tracking_delay);
       break;
-    case 67:
-      // 버튼 6: 속도 증가 500씩
-      tracking_delay = max((long)tracking_delay - 500, MAX_DELAY);
-      updateDisplay();
-      Serial.println(tracking_delay);
-      break;
-    case 68:
-      // 버튼 4: 속도 감소 500씩
-      tracking_delay += 500;
-      updateDisplay();
-      Serial.println(tracking_delay);
-      break;
-    case 25:
-      // 0: 속도 저장 Tracking.. 때만 저장 됨.
-      if (currentStatus == "Tracking..") {
-        default_delay = tracking_delay;
-        playMelody(speedSaveMelodyA, speedSaveDurationsA, sizeof(speedSaveMelodyA) / sizeof(speedSaveMelodyA[0]));
-        updateDisplay();
-      } else {
-        playBeepLow(200);
-      }
-      break;
-    case 64:
-      // 버튼 5 : 어떤 상태에서건 Tracking.. 상태로
-      moveRight = false;
-      tracking_delay = default_delay;
-      currentStatus = "Tracking..";
-      playMelody(trackingMelodyB, trackingDurationsB, sizeof(trackingMelodyB) / sizeof(trackingMelodyB[0]));
-      updateDisplay();
-      motorRunning = true;
-      break;
+
     default:
-      currentStatus = "Unknown Cmd";
+      currentStatus = "Unknwn Cmd";
       break;
   }
   IrReceiver.resume();
@@ -447,10 +549,21 @@ void updateDisplay() {
   display.setTextColor(SSD1306_WHITE);  // Draw white text
   display.setCursor(0, 0);
   display.println(currentStatus);
-  display.print("T: ");
-  display.println(tracking_delay);
-  display.print("D: ");
-  display.print(default_delay);
+  display.print("D : ");
+  if(tracking_delay >= stop_delay) {
+    display.println("-----");
+  } else {
+    display.println(tracking_delay);
+  }
+
+  display.setTextSize(1);
+  display.print("Mem. Delay: ");
+  display.println(default_delay);
+  display.print("L/R Angle :");
+  display.println(roll, 1);
+  display.print("Pitch: ");
+  display.print(pitch, 1);
+  display.println();
   display.display();
   Serial.println(currentStatus);
   // delay(10);
@@ -475,6 +588,89 @@ void playBeepLow(int duration) {
   delay(duration);
   noTone(piezoPin);
 }
+
+void checkLeftLimit() {
+  // 왼쪽이 LIMIT_ANGLE 넘어가면 종료위치 도달!
+  if (roll > LIMIT_ANGLE) {
+    if (currentStatus == "Tracking..") {
+      // checkIR 함수의 case 69 (왼쪽 끝 도달)
+      stopMotors();
+      atRightEnd = false;
+      currentStatus = "End.";
+      updateDisplay();
+      playMelody(lgMelody, lgMelodyDurations, lgLen);
+    } else if (currentStatus == "Mov E Pos") {
+      // checkIR 함수의 case 70 (정지)
+      printDrvStatus();
+      stopMotors();
+      currentStatus = "Stopped";
+      updateDisplay();
+      playMelody(stopMelodyA, stopDurationsA, sizeof(stopMelodyA) / sizeof(stopMelodyA[0]));
+    }
+    // 나머지 상태에선 아무것도 안 함
+  }
+}
+
+void checkRightLimit() {
+  // 오른쪽이 LIMIT_ANGLE 넘어가면 시작위치 도달!
+  if (roll < -LIMIT_ANGLE) {
+    if (currentStatus == "Mov B Pos") {
+      // checkIR 함수의 case 71 (시작위치 도달)
+      stopMotors();
+      atRightEnd = true;
+      currentStatus = "Start Rdy";
+      updateDisplay();
+      playMelody(starMelody, starDurations, starLen);
+    }
+    // 나머지 상태에선 아무것도 안 함
+  }
+}
+
+void startLeveling() {
+  if (abs(roll) > leveling_tolerance) { // 이미 충분히 수평이면 굳이 이동 안 해도 됨
+    if (roll > 0) {
+      moveRight = true;
+      tracking_delay = MAX_DELAY; // 빠른 이동
+      currentStatus = "Leveling>";
+    } else {
+      moveRight = false;
+      tracking_delay = MAX_DELAY; // 빠른 이동
+      currentStatus = "Leveling<";
+    }
+    motorRunning = true;
+  } else {
+    // 이미 수평임
+    currentStatus = "Welcome..";
+    motorRunning = false;
+  }
+  updateDisplay();
+}
+
+void checkLevelingComplete() {
+  if ((currentStatus == "Leveling>" || currentStatus == "Leveling<") && abs(roll) <= leveling_tolerance) {
+    stopMotors();
+    currentStatus = "Welcome..";
+    updateDisplay();
+    playMelody(welcomeMelody, welcomeDurations, sizeof(welcomeMelody) / sizeof(welcomeMelody[0]));
+  }
+}
+
+// 이동 평균 + 이상값 배제 (Roll, Pitch용 별도)
+float filterValue(float newValue, float& lastValue, float* buffer, int& index, float& sum) {
+  // 이상값 배제: 직전값과의 차이가 너무 크면 이전 값 유지
+  if (abs(newValue - lastValue) > JUMP_THRESHOLD) {
+    newValue = lastValue;
+  }
+  lastValue = newValue;
+
+  // 이동평균 적용
+  sum -= buffer[index];
+  buffer[index] = newValue;
+  sum += newValue;
+  index = (index + 1) % FILTER_SIZE;
+  return sum / FILTER_SIZE;
+}
+
 
 void printDrvStatus() {
   uint32_t drvStatus = driver.DRV_STATUS();
