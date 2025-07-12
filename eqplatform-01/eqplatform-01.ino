@@ -33,7 +33,7 @@ constexpr int piezoPin = 10;  // piezo speaker
 constexpr int ledPin = 11;   // Red LED. 보조배터리 전원공급 유지용
 constexpr int irPin = 12;    // IR receiver
 
-const unsigned long MAX_DELAY = 80;
+const unsigned long MAX_DELAY = 200;
 unsigned long default_delay = 11365;   // AI 추천값 11365, 마지막 측정값 5300
 unsigned long tracking_delay = 11365;  // AI 추천값 11365, 마지막 측정값 5300
 unsigned long stop_delay = 99999999;
@@ -184,6 +184,8 @@ float pitchSum = 0;
 float lastPitch = 0;
 float pitchFiltered = 0;
 
+// 기울기 센서 사용 여부
+boolean isSensorOn = false;
 
 void setup() {
   Serial.begin(115200);
@@ -224,8 +226,8 @@ void setup() {
   Serial1.begin(115200);
   driver.begin();
   driver.toff(4);               // 필수 초기 설정
-  driver.rms_current(600);      // mA
-  driver.hold_multiplier(1.0);  // 정지 시 전류 100% 유지. -- 보조배터리 전원 차단 문제 때문.
+  driver.rms_current(200);      // mA
+  driver.hold_multiplier(1.0);  // 정지 시 전류 70% 유지. -- 보조배터리 전원 차단 문제 때문.
   driver.en_spreadCycle(true);  // StealthChop Off
   driver.microsteps(8);         // 8 마이크로스텝으로 설정
   driver.intpol(true);          // 보간 켬 (기본값)
@@ -245,15 +247,17 @@ void setup() {
   digitalWrite(ledPin, HIGH);
 
 
-  Wire.begin();
-  sensor.setWire(&Wire);
-  sensor.beginAccel();
-  // sensor.beginGyro(); // 기울기만 쓸 땐 생략해도 OK
-  // sensor.beginMag();  // 자력계 필요 없으니 생략
-  
+  if(isSensorOn == true) {
+    Wire.begin();
+    sensor.setWire(&Wire);
+    sensor.beginAccel();
+    // sensor.beginGyro(); // 기울기만 쓸 땐 생략해도 OK
+    // sensor.beginMag();  // 자력계 필요 없으니 생략
+  }  
+
   updateDisplay();
   playMelody(welcomeMelody, welcomeDurations, sizeof(welcomeMelody) / sizeof(welcomeMelody[0]));
-
+  
 }
 
 void loop() {
@@ -280,35 +284,38 @@ void loop() {
     Serial.println();
   }
 
-  // MPU-9250 기울기 센서 인식 값 갱신
-  sensor.accelUpdate();
-  float ax = sensor.accelX();
-  float ay = sensor.accelY();
-  float az = sensor.accelZ();
-  
-  float rawPitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI; // 앞/뒤
-  float rawRoll  = atan2(ay, az) * 180.0 / PI * -1; // 좌/우
+  if(isSensorOn == true) {
+    // MPU-9250 기울기 센서 인식 값 갱신
+    sensor.accelUpdate();
+    float ax = sensor.accelX();
+    float ay = sensor.accelY();
+    float az = sensor.accelZ();
+    
+    float rawPitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI; // 앞/뒤
+    float rawRoll  = atan2(ay, az) * 180.0 / PI * -1; // 좌/우
 
-  // 2. 필터 적용
-  pitchFiltered = filterValue(rawPitch, lastPitch, pitchBuffer, pitchIndex, pitchSum);
-  rollFiltered  = filterValue(rawRoll, lastRoll, rollBuffer, rollIndex, rollSum);
+    // 2. 필터 적용
+    pitchFiltered = filterValue(rawPitch, lastPitch, pitchBuffer, pitchIndex, pitchSum);
+    rollFiltered  = filterValue(rawRoll, lastRoll, rollBuffer, rollIndex, rollSum);
 
-  pitch = pitchFiltered; // 앞/뒤 - 전역변수
-  roll = rollFiltered;   // 좌/우 - 전역변수
+    pitch = pitchFiltered; // 앞/뒤 - 전역변수
+    roll = rollFiltered;   // 좌/우 - 전역변수
 
-  // 각도 제한 체크 (좌우 임계 각도를 넘어가는지)
-  checkLeftLimit();
-  checkRightLimit();
+    // 각도 제한 체크 (좌우 임계 각도를 넘어가는지)
+    checkLeftLimit();
+    checkRightLimit();
 
-  // 레벨링 체크 
-  checkLevelingComplete();
+    // 레벨링 체크 
+    checkLevelingComplete();
+  }
+
 
   // 모터 구동 상태이면 한 스텝씩 펄스 발생
   if (motorRunning) {
     // 이동 방향에 따라 모터 방향 설정 및 딜레이 적용
     unsigned long now = millis();
     if (moveRight) {
-      if (now - lastStepTime >= MAX_DELAY) {
+      if (now - lastStepTime >= MAX_DELAY) { // 불필요 코드
         // 오른쪽(시계방향) -> MAX_DELAY 사용
         digitalWrite(dirPin, HIGH);
         stepMotors();
@@ -316,7 +323,7 @@ void loop() {
       }
 
     } else {
-      if (now - lastStepTime >= tracking_delay) {
+      if (now - lastStepTime >= tracking_delay) { // 불필요 코드
         // 왼쪽(반시계방향) -> tracking_delay 사용
         digitalWrite(dirPin, LOW);
         stepMotors();
@@ -325,10 +332,13 @@ void loop() {
     }
   }
 
-  // OLED 디스플레이 주기적 갱신
-  if (millis() - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
-    updateDisplay();
-    lastDisplayUpdate = millis();
+  
+  if(isSensorOn == true) {
+    // 자이로 상태를 보기 위해 OLED 디스플레이 주기적 갱신 -- 느려지는 버그 있음.
+    if (millis() - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
+      updateDisplay();
+      lastDisplayUpdate = millis();
+    }
   }
 }
 
@@ -535,6 +545,7 @@ void stepMotors() {
   digitalWrite(stepPin, HIGH);
   delayMicroseconds(80);  // 최소 펄스 유지 시간
   digitalWrite(stepPin, LOW);
+  //lastStepTime = millis();
 }
 
 // 모터 정지
