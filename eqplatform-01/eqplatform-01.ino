@@ -33,7 +33,7 @@ constexpr int piezoPin = 10;  // piezo speaker
 constexpr int ledPin = 11;   // Red LED. 보조배터리 전원공급 유지용
 constexpr int irPin = 12;    // IR receiver
 
-const unsigned long MAX_DELAY = 200;
+const unsigned long MAX_DELAY = 300;  // micro second 단위
 unsigned long default_delay = 11365;   // AI 추천값 11365, 마지막 측정값 5300
 unsigned long tracking_delay = 11365;  // AI 추천값 11365, 마지막 측정값 5300
 unsigned long stop_delay = 99999999;
@@ -162,12 +162,12 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // OLED Display 갱신 interval
 unsigned long lastDisplayUpdate = 0;
-const unsigned long DISPLAY_UPDATE_INTERVAL = 500; // 500ms
+const unsigned long DISPLAY_UPDATE_INTERVAL = 800; // 800ms
 
 
 // Roll, Pitch 값 필터용 변수
 // 필터 파라미터
-const int FILTER_SIZE = 20;         // 이동평균 샘플 개수 (원하면 10~20까지 조절)
+const int FILTER_SIZE = 10;         // 이동평균 샘플 개수 (원하면 10~20까지 조절)
 const float JUMP_THRESHOLD = 5.0;  // 한 번에 튈 때 무시할 각도 임계값
 
 // Roll용 버퍼
@@ -186,6 +186,9 @@ float pitchFiltered = 0;
 
 // 기울기 센서 사용 여부
 boolean isSensorOn = false;
+
+unsigned long lastSensorUpdate = 0;
+const unsigned long SENSOR_UPDATE_INTERVAL = 100; // ms (0.1초, 필요시 더 느리게도 OK)
 
 void setup() {
   Serial.begin(115200);
@@ -226,8 +229,8 @@ void setup() {
   Serial1.begin(115200);
   driver.begin();
   driver.toff(4);               // 필수 초기 설정
-  driver.rms_current(200);      // mA
-  driver.hold_multiplier(1.0);  // 정지 시 전류 70% 유지. -- 보조배터리 전원 차단 문제 때문.
+  driver.rms_current(600);      // mA
+  driver.hold_multiplier(1.0);  // 정지 시 전류 100% 유지. -- 보조배터리 전원 차단 문제 때문.
   driver.en_spreadCycle(true);  // StealthChop Off
   driver.microsteps(8);         // 8 마이크로스텝으로 설정
   driver.intpol(true);          // 보간 켬 (기본값)
@@ -284,7 +287,9 @@ void loop() {
     Serial.println();
   }
 
-  if(isSensorOn == true) {
+  unsigned long nowMillis = millis();
+
+  if(isSensorOn && nowMillis - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL) {
     // MPU-9250 기울기 센서 인식 값 갱신
     sensor.accelUpdate();
     float ax = sensor.accelX();
@@ -301,6 +306,8 @@ void loop() {
     pitch = pitchFiltered; // 앞/뒤 - 전역변수
     roll = rollFiltered;   // 좌/우 - 전역변수
 
+    lastSensorUpdate = nowMillis;
+
     // 각도 제한 체크 (좌우 임계 각도를 넘어가는지)
     checkLeftLimit();
     checkRightLimit();
@@ -313,13 +320,14 @@ void loop() {
   // 모터 구동 상태이면 한 스텝씩 펄스 발생
   if (motorRunning) {
     // 이동 방향에 따라 모터 방향 설정 및 딜레이 적용
-    unsigned long now = millis();
+    unsigned long now = micros();
     if (moveRight) {
       if (now - lastStepTime >= MAX_DELAY) { // 불필요 코드
         // 오른쪽(시계방향) -> MAX_DELAY 사용
         digitalWrite(dirPin, HIGH);
         stepMotors();
-        delayMicroseconds(MAX_DELAY);
+        //delayMicroseconds(MAX_DELAY);
+        lastStepTime = now;
       }
 
     } else {
@@ -327,7 +335,8 @@ void loop() {
         // 왼쪽(반시계방향) -> tracking_delay 사용
         digitalWrite(dirPin, LOW);
         stepMotors();
-        delayMicroseconds(tracking_delay);
+        //delayMicroseconds(tracking_delay);
+        lastStepTime = now;
       }
     }
   }
@@ -435,8 +444,6 @@ void checkIR(long cmd) {
       updateDisplay();
       playMelody(starMelody, starDurations, starLen);
       break;
-
-
     case 68:
       // 0x44 버튼 4: 속도 감소 500씩
       tracking_delay += 500;
@@ -458,8 +465,23 @@ void checkIR(long cmd) {
       updateDisplay();
       Serial.println(tracking_delay);
       break;
-
-
+    case 7:
+      // 0x7 버튼 7: 
+      break;
+    case 21:
+      // 0x15 버튼 8: 
+      isSensorOn = !isSensorOn;
+      if(isSensorOn == true) {
+        Wire.begin();
+        sensor.setWire(&Wire);
+        sensor.beginAccel();
+        // sensor.beginGyro(); // 기울기만 쓸 땐 생략해도 OK
+        // sensor.beginMag();  // 자력계 필요 없으니 생략
+      }  
+      break;
+    case 9:
+      // 0x9 버튼 9: 
+      break;
     case 22:
       // 0x16 버튼 *: 가운데로 빠르게 이동후 Welcome.. 상태로
       printDrvStatus();
@@ -545,7 +567,6 @@ void stepMotors() {
   digitalWrite(stepPin, HIGH);
   delayMicroseconds(80);  // 최소 펄스 유지 시간
   digitalWrite(stepPin, LOW);
-  //lastStepTime = millis();
 }
 
 // 모터 정지
@@ -570,6 +591,9 @@ void updateDisplay() {
   display.setTextSize(1);
   display.print("Mem. Delay: ");
   display.println(default_delay);
+  display.print("Level Sensor: ");
+  display.print(isSensorOn ? "On" : "Off");
+  display.println();  
   display.print("L/R Angle :");
   display.println(roll, 1);
   display.print("Pitch: ");
