@@ -7,7 +7,7 @@
 
 MPU9250_asukiaaa sensor;
 float pitch = 0, roll = 0;
-const float LIMIT_ANGLE = 30.0;  // 예시: ±4도 제한
+const float LIMIT_ANGLE = 6.5;  // ±6.5도 제한
 
 
 #if !defined(STR_HELPER)
@@ -170,6 +170,11 @@ const unsigned long DISPLAY_UPDATE_INTERVAL = 800; // 800ms
 const int FILTER_SIZE = 10;         // 이동평균 샘플 개수 (원하면 10~20까지 조절)
 const float JUMP_THRESHOLD = 5.0;  // 한 번에 튈 때 무시할 각도 임계값
 
+// 연속 점프 카운트
+const int MAX_JUMP_COUNT = 3;
+int jumpCountRoll = 0;
+int jumpCountPitch = 0;
+
 // Roll용 버퍼
 float rollBuffer[FILTER_SIZE] = {0};
 int rollIndex = 0;
@@ -187,8 +192,11 @@ float pitchFiltered = 0;
 // 기울기 센서 사용 여부
 boolean isSensorOn = false;
 
+// 소리 사용 여부
+boolean isSoundOn = true;
+
 unsigned long lastSensorUpdate = 0;
-const unsigned long SENSOR_UPDATE_INTERVAL = 100; // ms (0.1초, 필요시 더 느리게도 OK)
+const unsigned long SENSOR_UPDATE_INTERVAL = 200; // ms (0.1초, 필요시 더 느리게도 OK)
 
 void setup() {
   Serial.begin(115200);
@@ -299,9 +307,14 @@ void loop() {
     float rawPitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI; // 앞/뒤
     float rawRoll  = atan2(ay, az) * 180.0 / PI * -1; // 좌/우
 
+    // 센서 거꾸로 장착 보정 (180도 회전)
+    rawRoll += 180.0;
+    if (rawRoll > 180.0) rawRoll -= 360.0;  // -180 ~ 180 범위로 조정
+    rawRoll = -rawRoll;  // 좌우 반전
+
     // 2. 필터 적용
-    pitchFiltered = filterValue(rawPitch, lastPitch, pitchBuffer, pitchIndex, pitchSum);
-    rollFiltered  = filterValue(rawRoll, lastRoll, rollBuffer, rollIndex, rollSum);
+    pitchFiltered = filterValue(rawPitch, lastPitch, pitchBuffer, pitchIndex, pitchSum, jumpCountPitch);
+    rollFiltered  = filterValue(rawRoll, lastRoll, rollBuffer, rollIndex, rollSum,  jumpCountRoll);
 
     pitch = pitchFiltered; // 앞/뒤 - 전역변수
     roll = rollFiltered;   // 좌/우 - 전역변수
@@ -323,8 +336,8 @@ void loop() {
     unsigned long now = micros();
     if (moveRight) {
       if (now - lastStepTime >= MAX_DELAY) { // 불필요 코드
-        // 오른쪽(시계방향) -> MAX_DELAY 사용
-        digitalWrite(dirPin, HIGH);
+        // 오른쪽(반시계방향) -> MAX_DELAY 사용
+        digitalWrite(dirPin, LOW);
         stepMotors();
         //delayMicroseconds(MAX_DELAY);
         lastStepTime = now;
@@ -332,8 +345,8 @@ void loop() {
 
     } else {
       if (now - lastStepTime >= tracking_delay) { // 불필요 코드
-        // 왼쪽(반시계방향) -> tracking_delay 사용
-        digitalWrite(dirPin, LOW);
+        // 왼쪽(시계방향) -> tracking_delay 사용
+        digitalWrite(dirPin, HIGH);
         stepMotors();
         //delayMicroseconds(tracking_delay);
         lastStepTime = now;
@@ -466,10 +479,16 @@ void checkIR(long cmd) {
       Serial.println(tracking_delay);
       break;
     case 7:
-      // 0x7 버튼 7: 
+      // 0x7 버튼 7: 소리 ON/OFF 토글
+      isSoundOn = !isSoundOn;
+      if(isSoundOn == true) {
+        playBeep(200);  // 소리 ON 확인음 (짧게)
+      }
+      // 소리 OFF일 때는 당연히 소리가 안남
+      updateDisplay();
       break;
     case 21:
-      // 0x15 버튼 8: 
+      // 0x15 버튼 8: 센서 ON/OFF 토글
       isSensorOn = !isSensorOn;
       if(isSensorOn == true) {
         Wire.begin();
@@ -477,7 +496,11 @@ void checkIR(long cmd) {
         sensor.beginAccel();
         // sensor.beginGyro(); // 기울기만 쓸 땐 생략해도 OK
         // sensor.beginMag();  // 자력계 필요 없으니 생략
-      }  
+        playBeep(800);  // 센서 ON 소리
+      } else {
+        playBeepLow(400);  // 센서 OFF 소리
+      }
+      updateDisplay();  // 즉시 디스플레이 업데이트
       break;
     case 9:
       // 0x9 버튼 9: 
@@ -591,9 +614,10 @@ void updateDisplay() {
   display.setTextSize(1);
   display.print("Mem. Delay: ");
   display.println(default_delay);
-  display.print("Level Sensor: ");
+  display.print("Lv.Snsr: ");
   display.print(isSensorOn ? "On" : "Off");
-  display.println();  
+  display.print(" Snd: ");
+  display.println(isSoundOn ? "On" : "Off");
   display.print("L/R Angle :");
   display.println(roll, 1);
   display.print("Pitch: ");
@@ -605,6 +629,7 @@ void updateDisplay() {
 }
 
 void playMelody(int *melody, int *durations, int length) {
+  if (!isSoundOn) return;  // 소리 꺼져있으면 실행 안함
   for (int i = 0; i < length; i++) {
     tone(piezoPin, melody[i], durations[i]);
     delay(durations[i] * 1.2);
@@ -613,12 +638,14 @@ void playMelody(int *melody, int *durations, int length) {
 }
 
 void playBeep(int duration) {
+  if (!isSoundOn) return;  // 소리 꺼져있으면 실행 안함
   tone(piezoPin, 1000);
   delay(duration);
   noTone(piezoPin);
 }
 
 void playBeepLow(int duration) {
+  if (!isSoundOn) return;  // 소리 꺼져있으면 실행 안함
   tone(piezoPin, 200);
   delay(duration);
   noTone(piezoPin);
@@ -691,10 +718,18 @@ void checkLevelingComplete() {
 }
 
 // 이동 평균 + 이상값 배제 (Roll, Pitch용 별도)
-float filterValue(float newValue, float& lastValue, float* buffer, int& index, float& sum) {
-  // 이상값 배제: 직전값과의 차이가 너무 크면 이전 값 유지
+float filterValue(float newValue, float& lastValue, float* buffer, int& index, float& sum, int& jumpCount) {
   if (abs(newValue - lastValue) > JUMP_THRESHOLD) {
-    newValue = lastValue;
+    jumpCount++;
+    if (jumpCount < MAX_JUMP_COUNT) {
+      // 한두 번은 무시
+      newValue = lastValue;
+    } else {
+      // 연속으로 튀면 변화 허용(센서가 급격하게 움직였다고 판단)
+      jumpCount = 0;
+    }
+  } else {
+    jumpCount = 0;
   }
   lastValue = newValue;
 
