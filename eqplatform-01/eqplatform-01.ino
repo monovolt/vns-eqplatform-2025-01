@@ -689,6 +689,12 @@ void checkRightLimit() {
 }
 
 void startLeveling() {
+  // 센서가 꺼져있으면 leveling 불가능 - 경고음만 내고 리턴
+  if (!isSensorOn) {
+    playBeepLow(300);
+    return;
+  }
+
   if (abs(roll) > leveling_tolerance) { // 이미 충분히 수평이면 굳이 이동 안 해도 됨
     if (roll > 0) {
       moveRight = true;
