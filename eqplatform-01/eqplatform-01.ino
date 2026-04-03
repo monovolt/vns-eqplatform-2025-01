@@ -195,6 +195,9 @@ boolean isSensorOn = false;
 // 소리 사용 여부
 boolean isSoundOn = true;
 
+// Roll 영점 보정값 (센서 calibration용)
+float rollOffset = 0.0;
+
 unsigned long lastSensorUpdate = 0;
 const unsigned long SENSOR_UPDATE_INTERVAL = 200; // ms (0.1초, 필요시 더 느리게도 OK)
 
@@ -317,7 +320,7 @@ void loop() {
     rollFiltered  = filterValue(rawRoll, lastRoll, rollBuffer, rollIndex, rollSum,  jumpCountRoll);
 
     pitch = pitchFiltered; // 앞/뒤 - 전역변수
-    roll = rollFiltered;   // 좌/우 - 전역변수
+    roll = rollFiltered - rollOffset;   // 좌/우 - 전역변수 (영점 보정 적용)
 
     lastSensorUpdate = nowMillis;
 
@@ -503,7 +506,15 @@ void checkIR(long cmd) {
       updateDisplay();  // 즉시 디스플레이 업데이트
       break;
     case 9:
-      // 0x9 버튼 9: 
+      // 0x9 버튼 9: 센서 영점 보정값 저장 (Welcome 상태 & ±3도 이내에서만)
+      if (currentStatus == "Welcome.." && abs(roll) <= 3.0) {
+        rollOffset = roll;  // 현재 roll 값을 offset으로 저장
+        playMelody(speedSaveMelodyA, speedSaveDurationsA, sizeof(speedSaveMelodyA) / sizeof(speedSaveMelodyA[0]));
+        updateDisplay();
+      } else {
+        // 조건 불만족 시 경고음
+        playBeepLow(300);
+      }
       break;
     case 22:
       // 0x16 버튼 *: 가운데로 빠르게 이동후 Welcome.. 상태로
@@ -567,14 +578,14 @@ void checkIR(long cmd) {
       updateDisplay();
       break;
     case 24:
-      // 0x18 위 화살표: 속도 증가 50씩
-      tracking_delay = max((long)tracking_delay - 50, MAX_DELAY);
+      // 0x18 위 화살표: 속도 증가 20씩
+      tracking_delay = max((long)tracking_delay - 20, MAX_DELAY);
       updateDisplay();
       Serial.println(tracking_delay);
       break;
     case 82:
-      // 0x52 아래 화살표: 속도 감소 50씩
-      tracking_delay += 50;
+      // 0x52 아래 화살표: 속도 감소 20씩
+      tracking_delay += 20;
       updateDisplay();
       Serial.println(tracking_delay);
       break;
@@ -619,7 +630,10 @@ void updateDisplay() {
   display.print(" Snd: ");
   display.println(isSoundOn ? "On" : "Off");
   display.print("L/R Angle :");
-  display.println(roll, 1);
+  display.print(roll, 1);
+  display.print(" (");
+  display.print(rollOffset, 1);
+  display.println(")");
   display.print("Pitch: ");
   display.print(pitch, 1);
   display.println();
